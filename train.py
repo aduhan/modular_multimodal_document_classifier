@@ -25,6 +25,7 @@ if not os.path.isdir('validation_predictions'):
     os.mkdir("validation_predictions")
     
 AUTOTUNE = tf.data.experimental.AUTOTUNE
+base_path = "data/images/"
 
 def transform_image(file_path: str, args: argparse.Namespace) -> np.array:
     """Transfrom an image according to the model
