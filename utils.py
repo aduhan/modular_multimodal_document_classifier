@@ -1,7 +1,18 @@
-import pandas as pd
 import json
+from typing import Tuple
 
-def get_paths(model_name: str):
+import pandas as pd
+
+
+def get_paths(model_name: str) -> Tuple:
+    """Get the paths for train, val and test set.
+    
+    Args:
+        model_name: name of the model
+        
+    Returns:
+        Tuple: a tuple of different file paths
+    """
     
     if model_name != "distilbert":
         train_path = "data/labels/train.txt"

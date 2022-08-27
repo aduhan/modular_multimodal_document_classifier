@@ -26,25 +26,6 @@ if not os.path.isdir('validation_predictions'):
     
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
-train_path = "data/labels/train.txt"
-val_path = "data/labels/val.txt"
-test_path = "data/labels/val.txt"
-base_path = "data/images/"
-    
-num_classes = 16
-
-train_paths = pd.read_csv(train_path, header=None)[0].apply(lambda x: x.split(" "))
-val_paths = pd.read_csv(val_path, header=None)[0].apply(lambda x: x.split(" "))
-test_paths = pd.read_csv(test_path, header=None)[0].apply(lambda x: x.split(" "))
-
-# the following file from the test set was found to be corrupt
-corrupt_file_path = "imagese/e/j/e/eje42e00/2500126531_2500126536.tif"
-test_paths = test_paths[test_paths.apply(lambda x: corrupt_file_path not in x)].reset_index(drop=True)
-
-train_paths = train_paths[0:128]
-val_paths = val_paths[0:64]
-
-
 def transform_image(file_path: str, args: argparse.Namespace) -> np.array:
     """Transfrom an image according to the model
 
