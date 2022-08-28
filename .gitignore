@@ -2,3 +2,6 @@ __pycache__
 data
 models
 validation_predictions
+fine_tuned_models
+fine_tuned_data
+fine_tuned_predictions

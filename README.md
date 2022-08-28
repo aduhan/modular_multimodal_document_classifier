@@ -34,6 +34,18 @@ For an image only system, use the option ``image_only``.
 The default hyperparameters are those, which have achieved the highest test set accuracy on the [RVL-CDIP](https://adamharley.com/rvl-cdip/) dataset.
 Type ``python train.py -h`` for more information.
 
+## Finetune
+
+First make sure to have a file for labels in the same format as is used for the [RVL-CDIP](https://adamharley.com/rvl-cdip/) dataset,
+i.e. ``path/to/file label``. The paths should be absolute.
+
+When using a multimodal system, first run ``python extract_finetune_text.py`` (run ``python extract_finetune_text.py -h`` for more info).
+A labelsfile for a validation set is optional. If the training set size is big enough (defined as more than 10 files per class),
+then a validation set is automatically generated. For an image only system, run with the argument ``-image_only``. 
+
+The values for the default hyperparameters are those which have achieved the SOTA of **96.25%** on the Tobacco3482 dataset.
+Run ``python finetune.py -h`` to explore the available hyperparameters.
+
 ## Test
 
 The system can be tested with ``python train_base.py -file_path [file_path]``.

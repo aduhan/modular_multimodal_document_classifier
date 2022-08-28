@@ -1,4 +1,5 @@
 import argparse
+from json import load
 import os
 import re
 from glob import glob
@@ -131,7 +132,11 @@ def test(args: argparse.Namespace):
     
     predictions = []
     
-    model_paths = glob("models/*")
+    if args.use_fine_tuned_model:
+        model_paths = glob("fine_tuned_models/*")
+    else:
+        model_paths = glob("models/*")
+        
     model_names = ["holistic", "header", "footer", "left_body", "right_body", "distilbert"]
     
     for model_name in model_names:
@@ -164,9 +169,15 @@ def test(args: argparse.Namespace):
         dataset = np.concatenate((dataset, data), axis=1)
     
     if args.image_only:
-        meta_classifier_model = load_model("models/meta_classifier_image_only.hdf5")
+        if args.use_fine_tuned_model:
+            meta_classifier_model = load_model("fine_tuned_models/meta_classifier_image_only.hdf5")
+        else:
+            meta_classifier_model = load_model("models/meta_classifier_image_only.hdf5")
     else:
-        meta_classifier_model = load_model("models/meta_classifier.hdf5")
+        if args.use_fine_tuned_model:
+            meta_classifier_model = load_model("fine_tuned_models/meta_classifier.hdf5")
+        else:
+            meta_classifier_model = load_model("models/meta_classifier.hdf5")
         
     prediction = meta_classifier_model.predict(dataset)
     
@@ -180,8 +191,9 @@ def main():
     
     parser = argparse.ArgumentParser("Input the absolute/relative file path to get the prediction. Optionally, specify whether to use an image only system with -image_only.\n")
   
-    # Required argument
+    # Required arguments
     parser.add_argument('-file_path', required=True)
+    parser.add_argument('-use_fine_tuned_model', action=argparse.BooleanOptionalAction, required=True)
     
     # Optional model architecture argument
     parser.add_argument('-image_only', action=argparse.BooleanOptionalAction, default=False)

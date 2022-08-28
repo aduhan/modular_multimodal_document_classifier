@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import pickle
 from glob import glob
@@ -10,22 +11,19 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from PIL import Image
+from sklearn.model_selection import train_test_split
 from tensorflow.keras import layers
-from tensorflow.keras.applications import EfficientNetB1
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.models import Model, Sequential, load_model
 from transformers import DistilBertTokenizer, TFDistilBertModel
 
-from utils import get_paths
-
-if not os.path.isdir('models'):
-    os.mkdir("models")
+if not os.path.isdir('fine_tuned_models'):
+    os.mkdir("fine_tuned_models")
     
-if not os.path.isdir('validation_predictions'):
-    os.mkdir("validation_predictions")
+if not os.path.isdir('fine_tuned_predictions'):
+    os.mkdir("fine_tuned_predictions")
     
 AUTOTUNE = tf.data.experimental.AUTOTUNE
-base_path = "data/images/"
 
 def transform_image(file_path: str, args: argparse.Namespace) -> np.array:
     """Transfrom an image according to the model
@@ -116,7 +114,7 @@ def create_dataset_generator(file_paths: pd.Series, args: argparse.Namespace) ->
 
     def dataset_gen():
         for file_path in file_paths:
-            img = transform_image(base_path + file_path[0], args)
+            img = transform_image(file_path[0], args)
                             
             yield (img, file_path[1])
             
@@ -150,28 +148,21 @@ def build_image_model(args: argparse.Namespace) -> keras.engine.functional.Funct
         args: the arguments input
     """
     
-    inputs = layers.Input(shape=args.image_shape)
-
-    dropout = float(args.image_dropout)
-    num_dense_neurons = int(args.image_num_dense_neurons)
-    learning_rate = float(args.image_classification_head_learning_rate)
-
-    model = EfficientNetB1(include_top=False, input_tensor=inputs, weights="imagenet")
-
-    # Freeze the pretrained weights
-    model.trainable = False
+    model = load_model(f"models/{args.model_name}.hdf5")
+    model = Model(model.input, model.layers[-6].output)
+    inputs = model.input
+    model.trainable = False      
 
     # Rebuild top
     x = layers.GlobalAveragePooling2D(name="avg_pool")(model.output)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(dropout, name="top_dropout")(x)
-    x = layers.Dense(num_dense_neurons, activation='relu')(x)
-    outputs = layers.Dense(16, activation="softmax", name="pred")(x) # num_classes
+    x = layers.Dropout(args.image_dropout, name="top_dropout")(x)
+    x = layers.Dense(args.image_num_dense_neurons, activation='relu')(x)
+    outputs = layers.Dense(args.num_classes, activation="softmax", name="pred")(x) # num_classes
 
     # Compile
     model = tf.keras.Model(inputs, outputs, name="EfficientNet")
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=args.image_learning_rate)
 
     model.compile(
         optimizer=optimizer, loss="sparse_categorical_crossentropy", metrics=["accuracy"]
@@ -190,7 +181,7 @@ def build_text_model(args: argparse.Namespace)-> keras.engine.functional.Functio
     
     dropout = float(args.text_dropout)
     num_dense_neurons = int(args.text_num_dense_neurons)
-    learning_rate = float(args.text_classification_head_learning_rate)
+    learning_rate = float(args.text_learning_rate)
     max_len = int(args.max_len)
 
     dbert_model = TFDistilBertModel.from_pretrained('distilbert-base-uncased')
@@ -205,7 +196,7 @@ def build_text_model(args: argparse.Namespace)-> keras.engine.functional.Functio
     
     dense = layers.Dense(num_dense_neurons,activation='relu')(dbert_layer)
     dropout= layers.Dropout(dropout)(dense)
-    pred = layers.Dense(16, activation='softmax')(dropout)
+    pred = layers.Dense(args.num_classes, activation='softmax')(dropout)
     
     model = tf.keras.Model(inputs=[inps,masks], outputs=pred)
     
@@ -216,32 +207,6 @@ def build_text_model(args: argparse.Namespace)-> keras.engine.functional.Functio
             metrics=['accuracy'])
 
     return model
-
-
-def unfreeze_model(model: keras.engine.functional.Functional,
-                   learning_rate: float) -> keras.engine.functional.Functional:
-    """Unfreeze all layers of a model.
-    
-    Args:
-        model: the NN model
-        learning_rate: a new learning rate after unfreezing all weights
-        
-    Returns:
-        model: the unfrozen NN model
-    """
-    
-    # Unfreeze all layers
-    for layer in model.layers:
-        layer.trainable = True
-
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-    
-    model.compile(
-        optimizer=optimizer, loss="sparse_categorical_crossentropy", metrics=["accuracy"]
-    )
-
-    return model
-
 
 
 def train_image(args: argparse.Namespace):
@@ -258,60 +223,78 @@ def train_image(args: argparse.Namespace):
         args: the arguments input
     """
     
-    train_paths, val_paths, _, y_val, _ = get_paths(args.model_name)
+    # read and shuffle the data
+    train_paths = pd.read_csv(args.train_labels_paths, header=None)[0].apply(lambda x: x.split(" "))
+    train_paths = train_paths.sample(frac=1).reset_index(drop=True)
+    y_train = list(train_paths.apply(lambda x: int(x[1])))
 
-    es = EarlyStopping(
-        monitor="val_loss",
-        min_delta=0,
-        patience=10,
-        verbose=0,
-        mode="auto",
-        baseline=None,
-        restore_best_weights=False
-    )
+    validation_set = False
+    
+    if not isinstance(args.val_labels_paths, type(None)):
+        val_paths_df = pd.read_csv(args.val_labels_paths, header=None).sample(frac=1).reset_index(drop=True)
+        val_paths = val_paths_df[0].apply(lambda x: x.split(" "))
+        y_val = list(val_paths_df[0].apply(lambda x: int(x.split(" ")[1])))
+        
+        validation_set = True
+    
+    # if no path for validation labels is given and the number of examples per class is greater than min_dataset_size_for_val, take 10% of the training set for validation
+    elif isinstance(args.val_labels_paths, type(None)) and (pd.DataFrame.from_records([s[1] for s in train_paths]).value_counts() > int(args.min_dataset_size_for_val)).all():
+        temp_df = pd.DataFrame.from_records([(row[0], row[1]) for row in train_paths])
+        train_paths, val_paths = train_test_split(temp_df, test_size=0.1, stratify=temp_df[1], random_state=1) 
+        
+        train_paths = pd.Series(train_paths[0] + " " + train_paths[1]).apply(lambda x: x.split(" "))
+        val_paths = pd.Series(val_paths[0] + " " + val_paths[1]).apply(lambda x: x.split(" "))
+        
+        validation_set = True
     
     train_generator = create_dataset_generator(train_paths, args)
-    val_generator = create_dataset_generator(val_paths, args)
-
     train_ds = tf.data.Dataset.from_generator(train_generator, 
                                             output_types=(tf.float32, tf.int32),
                                             output_shapes=(args.image_shape, ([])))
-
-    val_ds = tf.data.Dataset.from_generator(val_generator, 
-                                            output_types=(tf.float32, tf.int32),
-                                            output_shapes=(args.image_shape, ([])))
-
-    train_ds = configure_for_performance(train_ds, int(args.image_batch_size))
-    val_ds = configure_for_performance(val_ds, int(args.image_batch_size))
-
     
-    if args.model_name == "holistic":
-        model = build_image_model(args)
-        
-        filepath = f"models/{args.model_name}_head.hdf5"
+    train_ds = configure_for_performance(train_ds, int(args.image_batch_size))
+    
+    model = build_image_model(args)
+    filepath = f"fine_tuned_models/{args.model_name}.hdf5"
+    
+    if validation_set:
+        val_generator = create_dataset_generator(val_paths, args)
+
+        val_ds = tf.data.Dataset.from_generator(val_generator, 
+                                                output_types=(tf.float32, tf.int32),
+                                                output_shapes=(args.image_shape, ([])))
+
+        val_ds = configure_for_performance(val_ds, int(args.image_batch_size))
+                
+        es = EarlyStopping(
+            monitor="val_loss",
+            min_delta=0,
+            patience=3,
+            verbose=0,
+            mode="auto",
+            baseline=None,
+            restore_best_weights=False
+        )
+    
         cp = ModelCheckpoint(filepath, monitor='val_accuracy', verbose=1, save_best_only=True, mode='max')
 
-        model.fit(train_ds, batch_size=int(args.image_batch_size), epochs=int(args.image_epochs), validation_data=val_ds, callbacks=[es, cp]) 
-        model = load_model(filepath)
+        model.fit(train_ds, batch_size=int(args.image_batch_size), epochs=int(args.image_epochs), validation_data=val_ds, callbacks=[es, cp])
         
-        new_learning_rate = float(args.image_learning_rate)
-        model = unfreeze_model(model, new_learning_rate)
+        predictions = model.predict(val_ds)
+        meta_classifier_data = [predictions, y_val]
         
-        os.remove(filepath)
+        with open(f"fine_tuned_predictions/validation_{args.model_name}.pkl", "wb") as f:
+            pickle.dump(meta_classifier_data, f)
     
     else:
-        model = load_model("models/holistic.hdf5")
+        model.fit(train_ds, batch_size=int(args.image_batch_size), epochs=int(args.image_epochs_if_no_val_set))
+        model.save(filepath)
+    
+        predictions = model.predict(train_ds)
+        meta_classifier_data = [predictions, y_train]
         
-    filepath = f"models/{args.model_name}.hdf5"
-    cp = ModelCheckpoint(filepath, monitor='val_accuracy', verbose=1, save_best_only=True, mode='max')
-
-    model.fit(train_ds, batch_size=int(args.image_batch_size), epochs=int(args.image_epochs), validation_data=val_ds, callbacks=[es, cp])
-    
-    predictions = model.predict(val_ds)
-    meta_classifier_data = [predictions, y_val]
-    
-    with open(f"validation_predictions/{args.model_name}.pkl", "wb") as f:
-        pickle.dump(meta_classifier_data, f)
+        with open(f"fine_tuned_predictions/train_{args.model_name}.pkl", "wb") as f:
+            pickle.dump(meta_classifier_data, f)
             
 
 def train_text(args: argparse.Namespace):
@@ -321,55 +304,75 @@ def train_text(args: argparse.Namespace):
     Args:
         args: the arguments input
     """
+    
+    validation_set = False
+    
+    if len(os.listdir("fine_tuned_data")) == 2:
+        with open("fine_tuned_data/train.json", "r") as train:
+            X_train = json.load(train)
+            
+        with open("fine_tuned_data/train_labels.json", "r") as train:
+            y_train = json.load(train)
+        
+        X_train = list(X_train.values())
+        y_train = list(pd.Series(y_train.values()).astype(int))
+        
+    else:
+        with open("fine_tuned_data/val.json", "r") as val:
+            X_val = json.load(val)
+        
+        with open("fine_tuned_data/val_labels.json", "r") as val:
+            y_val = json.load(val)   
+            
+        X_val = list(X_val.values())
+        y_val = list(pd.Series(y_val.values().astype(int)))
+        validation_set = True     
 
-    es = EarlyStopping(
-        monitor="val_loss",
-        min_delta=0,
-        patience=10,
-        verbose=0,
-        mode="auto",
-        baseline=None,
-        restore_best_weights=False
-    )
-    
-    X_train, X_val, _, y_train, y_val, _ = get_paths(args.model_name)
-    
     train_input, train_attention_masks = transform_text(X_train, args)
-    val_input, val_attention_masks = transform_text(X_val, args)
     
     model = build_text_model(args)
     
-    filepath = f"models/{args.model_name}_head.hdf5"
-    cp = ModelCheckpoint(filepath, monitor='val_accuracy', verbose=1, save_best_only=True, mode='max')
+    filepath = f"fine_tuned_models/{args.model_name}.hdf5"
 
-    model.fit([train_input,train_attention_masks],np.array(y_train), 
-              batch_size=int(args.text_batch_size),
-              epochs=int(args.text_epochs), 
-              validation_data=([val_input,val_attention_masks],np.array(y_val)),
-              callbacks=[es, cp]) 
-    
-    model = load_model(filepath)
-    
-    new_learning_rate = float(args.text_learning_rate)
-    model = unfreeze_model(model, new_learning_rate)
-    
-    os.remove(filepath)
-    
-    filepath = f"models/{args.model_name}.hdf5"
-    cp = ModelCheckpoint(filepath, monitor='val_accuracy', verbose=1, save_best_only=True, mode='max')
+    if validation_set:
+        val_input, val_attention_masks = transform_text(X_val, args)
+        
+        es = EarlyStopping(
+            monitor="val_loss",
+            min_delta=0,
+            patience=3,
+            verbose=0,
+            mode="auto",
+            baseline=None,
+            restore_best_weights=False
+        )
+        
+        cp = ModelCheckpoint(filepath, monitor='val_accuracy', verbose=1, save_best_only=True, mode='max')
 
-    model.fit([train_input,train_attention_masks],np.array(y_train), 
-              batch_size=int(args.text_batch_size),
-              epochs=int(args.text_epochs), 
-              validation_data=([val_input,val_attention_masks],np.array(y_val)), 
-              callbacks=[es, cp])  
+        model.fit([train_input,train_attention_masks],np.array(y_train), 
+                batch_size=int(args.text_batch_size),
+                epochs=int(args.text_epochs), 
+                validation_data=([val_input,val_attention_masks],np.array(y_val)),
+                callbacks=[es, cp])
+        
+        predictions = model.predict([val_input,val_attention_masks],batch_size=int(args.text_batch_size))
+        meta_classifier_data = [predictions, y_val]
+        
+        with open("fine_tuned_predictions/validation_distilbert.pkl", "wb") as f:
+            pickle.dump(meta_classifier_data, f)
+        
+    else: 
+        model.fit([train_input,train_attention_masks],np.array(y_train), 
+            batch_size=int(args.text_batch_size),
+            epochs=int(args.text_epochs_if_no_val_set))        
+        
+        model.save(filepath)
     
+        predictions = model.predict([train_input,train_attention_masks],batch_size=int(args.text_batch_size))
+        meta_classifier_data = [predictions, y_train]
     
-    predictions = model.predict([val_input,val_attention_masks],batch_size=int(args.text_batch_size))
-    meta_classifier_data = [predictions, y_val]
-    
-    with open("validation_predictions/distilbert.pkl", "wb") as f:
-        pickle.dump(meta_classifier_data, f)
+        with open("fine_tuned_predictions/train_distilbert.pkl", "wb") as f:
+            pickle.dump(meta_classifier_data, f)
         
 def train_meta(args: argparse.Namespace):
     """The meta classifier training is done here.
@@ -384,7 +387,7 @@ def train_meta(args: argparse.Namespace):
     es = EarlyStopping(
         monitor="val_loss",
         min_delta=0,
-        patience=5,
+        patience=3,
         verbose=0,
         mode="auto",
         baseline=None,
@@ -393,8 +396,18 @@ def train_meta(args: argparse.Namespace):
 
     model = Sequential()
     
-    meta_classifier_data_paths = glob("validation_predictions/*")
-    meta_classifier_data_paths = [path for path in meta_classifier_data_paths if path.endswith("pkl")]
+    meta_classifier_data_paths = glob("fine_tuned_predictions/*")
+    validation_set = False
+
+    train_paths = pd.read_csv(args.train_labels_paths, header=None)[0].apply(lambda x: x.split(" "))
+    if not isinstance(args.val_labels_paths, type(None)) or (isinstance(args.val_labels_paths, type(None)) and 
+                                                             (pd.DataFrame.from_records([s[1] for s in train_paths]).value_counts() > int(args.min_dataset_size_for_val)).all()):
+        validation_set = True
+
+    if validation_set:    
+        meta_classifier_data_paths = [path for path in meta_classifier_data_paths if path.endswith("pkl") and "validation" in path]
+    else:
+        meta_classifier_data_paths = [path for path in meta_classifier_data_paths if path.endswith("pkl") and "train" in path]
 
     data_order = ["holistic", "header", "footer", "left_body", "right_body", "distilbert"]
 
@@ -407,43 +420,49 @@ def train_meta(args: argparse.Namespace):
                     all_data.append(pickle.load(f))
     
     if args.image_only:
-        filepath = f"models/{args.model_name}_image_only.hdf5"
-        num_dense_neurons = args.meta_classifier_image_only_num_dense_neurons
-        learning_rate = args.meta_classifier_image_only_learning_rate
+        filepath = f"fine_tuned_models/{args.model_name}_image_only.hdf5"
         del all_data[-1]
     else:
-        filepath = f"models/{args.model_name}.hdf5"
-        num_dense_neurons = args.meta_classifier_multimodal_num_dense_neurons
-        learning_rate = args.meta_classifier_multimodal_learning_rate
-    
+        filepath = f"fine_tuned_models/{args.model_name}.hdf5"
+
+    print("ALL DATA", len(all_data))
     dataset = all_data[0][0]
     for data in all_data[1:]:
+        print("HI")
+        print(data[0].shape)
         dataset = np.concatenate((dataset, data[0]), axis=1)
     
-    # Take 90% of the validation dataset predictions as training set
+    # Take 90% of the predictions as training set
     x_train = dataset[int(len(dataset) * 0.1):]
-    x_val = dataset[:int(len(dataset) * 0.1)]
+    
+    if validation_set:
+        x_val = dataset[:int(len(dataset) * 0.1)]
+        y_val = all_data[0][1][:int(len(dataset) * 0.1)]
     
     y_train = all_data[0][1][int(len(dataset) * 0.1):]
-    y_val = all_data[0][1][:int(len(dataset) * 0.1)]
-        
-    model.add(layers.Dense(num_dense_neurons, input_dim=dataset.shape[1], activation='relu'))
-    model.add(layers.Dropout(args.dropout))
+
+    
+    model.add(layers.Dense(args.meta_classifier_num_dense_neurons, input_dim=dataset.shape[1], activation='relu'))
+    model.add(layers.Dropout(args.meta_classifier_dropout))
     
     for _ in range(args.meta_classifier_hidden_layers):
-        model.add(layers.Dense(num_dense_neurons, activation='relu'))
-        model.add(layers.Dropout(args.dropout))
+        model.add(layers.Dense(args.meta_classifier_num_dense_neurons, activation='relu'))
+        model.add(layers.Dropout(args.meta_classifier_dropout))
         
-    model.add(layers.Dense(16, activation='softmax'))
+    model.add(layers.Dense(args.num_classes, activation='softmax'))
         
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=args.meta_classifier_learning_rate)
 
     # compile the model
     model.compile(optimizer=optimizer, loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     
-    cp = ModelCheckpoint(filepath, monitor='val_accuracy', verbose=1, save_best_only=True, mode='max')
-    
-    model.fit(x_train, np.array(y_train), validation_data=(x_val, np.array(y_val)), epochs=50, batch_size=32, callbacks=[es, cp])
+    if validation_set:
+        cp = ModelCheckpoint(filepath, monitor='val_accuracy', verbose=1, save_best_only=True, mode='max')
+        model.fit(x_train, np.array(y_train), validation_data=(x_val, np.array(y_val)), epochs=50, batch_size=32, callbacks=[es, cp])
+    else:
+        model.fit(x_train, np.array(y_train), epochs=10, batch_size=32)
+        model.save(filepath)
+
 
 def main():
     """The main function.
@@ -454,49 +473,53 @@ def main():
     then subsequently train the 'header', 'footer', 'left_body' and 'right_body'. Optionally,
     train 'distilbert', if -image_only is set to False. The default hyperparameters are set such that the highest test set accuracy on RVL-CDIP is achieved.\n""")
 
-    # Required argument
+    # Required arguments
     parser.add_argument('-model_name', required=True, help="model_name is either 'holistic', 'header', 'footer', 'left_body', 'right_body' or 'distilbert'")
+    parser.add_argument('-train_labels_paths', required=True, help="input the training paths in the same format as for RVL-CDIP (see e.g. data/labels/train.txt)")
+    parser.add_argument('-num_classes', required=True, help="input the number of classes of the dataset")
+    
+    # Optional dataset arguments
+    parser.add_argument('-val_labels_paths', help="input the validation paths in the same format as for RVL-CDIP (see e.g. data/labels/val.txt)")
+    parser.add_argument('-min_dataset_size_for_val', default=10, help="the minimum size of the dataset per class in order to create a validation set if none is provided")
     
     # Optional model architecture argument
     parser.add_argument('-image_only', action=argparse.BooleanOptionalAction, default=False)
 
     # Optional image model hyperparameter arguments
-    parser.add_argument('-image_epochs', default=200)   
-    parser.add_argument('-image_classification_head_learning_rate', default=0.0001)  
-    parser.add_argument('-image_learning_rate', default=0.0001)  
+    parser.add_argument('-image_epochs', default=20)   
+    parser.add_argument('-image_epochs_if_no_val_set', default=10)
+    parser.add_argument('-image_learning_rate', default=0.001)  
     parser.add_argument('-image_dropout', default=0.3)   
     parser.add_argument('-image_num_dense_neurons', default=50)
     parser.add_argument('-image_batch_size', default=32)   
     
     # Optional text model hyperparameter arguments
-    parser.add_argument('-text_epochs', default=200)   
-    parser.add_argument('-text_classification_head_learning_rate', default=0.0001)  
-    parser.add_argument('-text_learning_rate', default=0.0001)  
+    parser.add_argument('-text_epochs', default=20)  
+    parser.add_argument('-text_epochs_if_no_val_set', default=10) 
+    parser.add_argument('-text_learning_rate', default=0.0005)  
     parser.add_argument('-text_dropout', default=0.3)   
     parser.add_argument('-text_num_dense_neurons', default=512)
     parser.add_argument('-text_batch_size', default=32)   
     
     # Optional metaclassifier hyperparameter arguments
-    parser.add_argument('-meta_classifier_image_only_num_dense_neurons', default=128)
-    parser.add_argument('-meta_classifier_multi_modal_num_dense_neurons', default=1024)
-    parser.add_argument('-meta_classifier_image_only_learning_rate', default=0.0005)
-    parser.add_argument('-meta_classifier_multi_modal_learning_rate', default=0.00005)
+    parser.add_argument('-meta_classifier_num_dense_neurons', default=256)
+    parser.add_argument('-meta_classifier_learning_rate', default=0.001)
     parser.add_argument('-meta_classifier_dropout', default=0.3)
-    parser.add_argument('-meta_classifier_hidden_layers', default=3)
-
+    parser.add_argument('-meta_classifier_hidden_layers', default=2)
+     
     # Optional preprocessing hyperparameter arguments
     parser.add_argument('-image_shape', default=(384,384,3))
     parser.add_argument('-max_len', default=256)
      
     args = parser.parse_args()    
-    
+        
     assert args.model_name == "holistic" or args.model_name == "header" or args.model_name == "footer" or args.model_name == "left_body" or args.model_name == "right_body" or args.model_name == "distilbert" or args.model_name == "meta_classifier", "model_name must be set to one of ['holistic', 'header', 'footer', 'left_body', 'right_body', 'distilbert', 'meta_classifier']"   
     
     if args.model_name == "meta_classifier":
-        assert len(os.listdir("validation_predictions")) == 5 or len(os.listdir("validation_predictions")) == 6, "first train all 5/6 base models (holistic, header, footer, left_body, right_body and optionally distilbert - depending on if an image only system is trained), then train the meta_classifier"
+        assert len(os.listdir("fine_tuned_predictions")) == 5 or len(os.listdir("fine_tuned_predictions")) == 6, "first train all 5/6 base models (holistic, header, footer, left_body, right_body and optionally distilbert - depending on if an image only system is trained), then train the meta_classifier"
     
     if args.model_name == "distilbert":
-        assert os.path.isdir('data/text') and len(os.listdir('data/text')) > 1
+        assert os.path.isdir('fine_tuned_data') and len(os.listdir('fine_tuned_data')) > 1, "extract the text first with extract_finetune_text.py"
     
     if args.model_name == "distilbert":
         train_text(args) 
